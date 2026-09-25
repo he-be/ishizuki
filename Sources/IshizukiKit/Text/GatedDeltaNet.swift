@@ -9,12 +9,13 @@ import MLXNN
 public final class GatedDeltaNet: @unchecked Sendable {
   private let inProjQKV: PackedLinear
   private let inProjZ: PackedLinear
+  private let sharedRotation: Bool
   private let inProjA: any Projection
   private let inProjB: any Projection
   private let conv1dWeight: MLXArray
-  private let aLog: MLXArray
+  private let decayRate: MLXArray
   private let dtBias: MLXArray
-  private let normWeight: MLXArray
+  private let normWeight: CastWeight
   private let outProj: PackedLinear
 
   private let numValueHeads: Int
@@ -30,7 +31,7 @@ public final class GatedDeltaNet: @unchecked Sendable {
   private let headRepeat: Int
   private let valueHeadLayout: ValueHeadLayout
 
-  private let unitKeyNorm: MLXArray
+  private let unitKeyNorm: CastWeight
   private let zSplit: (slice: ANESlice, tail: PackedLinear)?
 
   public init(
@@ -64,16 +65,17 @@ public final class GatedDeltaNet: @unchecked Sendable {
 
     self.inProjQKV = try factory.linear(prefix + ".in_proj_qkv")
     self.inProjZ = try factory.linear(prefix + ".in_proj_z")
+    self.sharedRotation = sharesRotation(inProjQKV, inProjZ)
     self.outProj = try factory.linear(prefix + ".out_proj")
 
     self.inProjA = try factory.projection(prefix + ".in_proj_a")
     self.inProjB = try factory.projection(prefix + ".in_proj_b")
     self.conv1dWeight = try store(tensorPrefix + ".conv1d.weight")
-    self.aLog = try store(tensorPrefix + ".A_log")
+    self.decayRate = -exp(try store(tensorPrefix + ".A_log").asType(.float32))
     self.dtBias = try store(tensorPrefix + ".dt_bias")
-    self.normWeight = try store(tensorPrefix + ".norm.weight")
+    self.normWeight = CastWeight(try store(tensorPrefix + ".norm.weight"))
 
-    self.unitKeyNorm = MLXArray.ones([keyHeadDim], dtype: .float32)
+    self.unitKeyNorm = CastWeight(MLXArray.ones([keyHeadDim], dtype: .float32))
 
     // Only the token-local z is offloaded. qkv feeds the delta rule's state, where an approximate
     // value would not stay local but compound along the prompt, so it keeps the 2-bit path.
@@ -102,7 +104,8 @@ public final class GatedDeltaNet: @unchecked Sendable {
       zTail = zSplit.tail.applyRotated(rotated)
     }
 
-    let qkv = inProjQKV(x)
+    let shared = zPending == nil && sharedRotation ? inProjQKV.rotate(x) : nil
+    let qkv = shared.map { inProjQKV.applyRotated($0) } ?? inProjQKV(x)
     let aRaw = inProjA(x)
     let bRaw = inProjB(x)
 
@@ -123,13 +126,13 @@ public final class GatedDeltaNet: @unchecked Sendable {
     let invScale = Float(keyHeadDim).squareRoot()
     q =
       (1.0 / (invScale * invScale))
-      * MLXFast.rmsNorm(q, weight: unitKeyNorm.asType(q.dtype), eps: 1e-6)
+      * MLXFast.rmsNorm(q, weight: unitKeyNorm(q.dtype), eps: 1e-6)
     k =
       (1.0 / invScale)
-      * MLXFast.rmsNorm(k, weight: unitKeyNorm.asType(k.dtype), eps: 1e-6)
+      * MLXFast.rmsNorm(k, weight: unitKeyNorm(k.dtype), eps: 1e-6)
 
     let beta = sigmoid(bRaw)
-    let g = exp(-exp(aLog.asType(.float32)) * softplus((aRaw + dtBias).asType(.float32)))
+    let g = exp(decayRate * softplus((aRaw + dtBias).asType(.float32)))
 
     let state =
       cache?.recurrentState
@@ -153,9 +156,11 @@ public final class GatedDeltaNet: @unchecked Sendable {
       z = concatenated([head, zTail], axis: -1)
         .reshaped([b, s, numValueHeads, valueHeadDim])
     }
-    let zValue = z ?? inProjZ(x).reshaped([b, s, numValueHeads, valueHeadDim])
+    let zValue =
+      z ?? (shared.map { inProjZ.applyRotated($0) } ?? inProjZ(x))
+      .reshaped([b, s, numValueHeads, valueHeadDim])
 
-    let normalized = MLXFast.rmsNorm(y, weight: normWeight.asType(y.dtype), eps: normEps)
+    let normalized = MLXFast.rmsNorm(y, weight: normWeight(y.dtype), eps: normEps)
     let z32 = zValue.asType(.float32)
     let activated = sigmoidOutputGate ? sigmoid(z32) : silu(z32)
     let gated = (activated * normalized.asType(.float32)).asType(x.dtype)

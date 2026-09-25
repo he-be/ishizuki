@@ -9,8 +9,8 @@ public final class DecoderLayer: @unchecked Sendable {
   public let isLinear: Bool
   private let linearAttention: GatedDeltaNet?
   private let selfAttention: Attention?
-  private let inputLayerNorm: MLXArray?
-  private let postAttentionLayerNorm: MLXArray?
+  private let inputLayerNorm: CastWeight?
+  private let postAttentionLayerNorm: CastWeight?
   /// A widened residual replaces both layer norms: the streams are normalised by the gate that
   /// mixes them, so a hyper-connected layer ships no `input_layernorm` at all.
   private let attnResidual: GatedResidual?
@@ -54,8 +54,9 @@ public final class DecoderLayer: @unchecked Sendable {
         layer == config.pleLayer
         ? try PLEBlock(config: config, module: module, factory: factory, store: store) : nil
     } else {
-      self.inputLayerNorm = try store(prefix + ".input_layernorm.weight")
-      self.postAttentionLayerNorm = try store(prefix + ".post_attention_layernorm.weight")
+      self.inputLayerNorm = CastWeight(try store(prefix + ".input_layernorm.weight"))
+      self.postAttentionLayerNorm = CastWeight(
+        try store(prefix + ".post_attention_layernorm.weight"))
       self.attnResidual = nil
       self.mlpResidual = nil
       self.ple = nil
@@ -149,14 +150,14 @@ public final class DecoderLayer: @unchecked Sendable {
     // and running the projections at the norm's width is how this got three times slower.
     let compute = compute ?? x.dtype
     let normed = MLXFast.rmsNorm(
-      x, weight: inputLayerNorm.asType(x.dtype), eps: eps
+      x, weight: inputLayerNorm(x.dtype), eps: eps
     ).asType(compute)
 
     let attended = attend(normed, mask: mask, cache: cache, positions: positions)
 
     let h = x + attended.asType(x.dtype)
     let postNormed = MLXFast.rmsNorm(
-      h, weight: postAttentionLayerNorm.asType(h.dtype), eps: eps
+      h, weight: postAttentionLayerNorm(h.dtype), eps: eps
     ).asType(compute)
     return h + mlp(postNormed).asType(h.dtype)
   }
@@ -166,7 +167,7 @@ public final class TextModel: @unchecked Sendable {
   public let config: BonsaiConfig.TextConfig
   public let embedTokens: PackedEmbedding
   public let layers: [DecoderLayer]
-  private let norm: MLXArray?
+  private let norm: CastWeight?
   /// A hyper-connected model has no final norm of its own: the mixer that folds the streams
   /// back into one width normalises them on the way, and the head reads what it returns.
   private let mixer: GatedResidual?
@@ -212,7 +213,7 @@ public final class TextModel: @unchecked Sendable {
         "model.hyper_connection_mixer", config: text, count: text.hcCount ?? 1,
         factory: factory, store: store)
     } else {
-      self.norm = try store(factory.tensorPrefix + "model.norm.weight")
+      self.norm = CastWeight(try store(factory.tensorPrefix + "model.norm.weight"))
       self.mixer = nil
     }
 
@@ -245,7 +246,7 @@ public final class TextModel: @unchecked Sendable {
 
   public func normed(_ h: MLXArray) -> MLXArray {
     if let mixer { return mixer(h).mixed.asType(h.dtype) }
-    return MLXFast.rmsNorm(h, weight: norm!.asType(h.dtype), eps: eps)
+    return MLXFast.rmsNorm(h, weight: norm!(h.dtype), eps: eps)
   }
 
   /// The last layer's activation before the final norm. An MTP head fuses this, not the

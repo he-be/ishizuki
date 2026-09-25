@@ -216,6 +216,27 @@ public enum GGMLKernels {
   /// fragment and meets every row in one multiply, where the matvec pays per row.
   public static let matmulFewRows = 2...8
 
+  private static let warmedLock = NSLock()
+  nonisolated(unsafe) private static var warmedTypes = Set<[Int]>()
+
+  /// Builds ``matmulFew`` for a block type at load. Shape and row count are arguments, so one
+  /// small product per activation dtype covers every projection of that type.
+  public static func warmFew(_ type: GGMLType) {
+    #if canImport(Metal)
+      guard BonsaiRuntime.useVerifyMatmul, type.isQuantized, type.blockSize == 256 else { return }
+      warmedLock.lock()
+      let fresh = warmedTypes.insert([Int(type.rawValue)]).inserted
+      warmedLock.unlock()
+      guard fresh else { return }
+      let rows = 128
+      let blocks = MLXArray.zeros([rows * type.typeSize], dtype: .uint8)
+      let outputs = [DType.float16, .float32, .bfloat16].compactMap {
+        matmulFew(MLXArray.zeros([8, 256], dtype: $0), blocks: blocks, type: type, outputDim: rows)
+      }
+      eval(outputs)
+    #endif
+  }
+
   public static func matmulFew(
     _ x: MLXArray, blocks: MLXArray, type: GGMLType, outputDim: Int, rowBlocks: Int = 2
   ) -> MLXArray? {
@@ -232,13 +253,12 @@ public enum GGMLKernels {
       let rowsPerGroup = 64 * rowBlocks
       let groups = (outputDim + rowsPerGroup - 1) / rowsPerGroup
       return matmulFewKernel(
-        [x, blocks] + GGMLGrids.buffers + [k, outputDim],
+        [x, blocks] + GGMLGrids.buffers + [k, outputDim, m],
         template: [
           ("IT", x.dtype),
           ("qtype", Int(type.rawValue)),
           ("block_bytes", type.typeSize),
           ("block_elems", type.blockSize),
-          ("vecs", m),
           ("grid_bytes", gridBytes(type)),
           ("sign_words", signWords(type)),
           ("RB", rowBlocks),
@@ -294,7 +314,7 @@ public enum GGMLKernels {
         name: "ggml_matmul_few",
         inputNames: [
           "x", "w", "g_iq2xxs", "g_iq2xs", "g_iq2s", "g_iq1s", "g_iq3xxs", "g_iq3s",
-          "ksigns", "kvalues", "K", "N",
+          "ksigns", "kvalues", "K", "N", "vecs",
         ],
         outputNames: ["y"],
         source: macros + blockMacros + captureEach + blockTables + matmulFewProlog + blockChain

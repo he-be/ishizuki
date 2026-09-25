@@ -121,6 +121,7 @@ public final class PackedLinear: @unchecked Sendable {
     self.collect = nil
     self.outputDim = blocks.outputDim
     self.inputDim = blocks.inputDim
+    GGMLKernels.warmFew(blocks.type)
   }
 
   public init(exl3 tensor: EXL3Tensor) {
@@ -178,38 +179,19 @@ public final class PackedLinear: @unchecked Sendable {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    if let ggml { return ggmlApply(x, ggml) }
-    if let exl3 { return EXL3Kernels.apply(x, exl3) }
-    var h = x
-    if block > 0, let signs {
-      if BonsaiRuntime.useFusedHadamard,
-        let fused = FusedHadamard.apply(h, block: block, signs: signs)
-      {
-        h = fused
-      } else {
-        h = hadamardRotate(h, block: block, signs: signs, inverse: false)
-      }
-    }
+    applyRotated(rotate(x))
+  }
 
-    if isDense {
-      collect?(h)
-      return matmul(h, weight.T.asType(h.dtype))
+  /// Several projections of one activation. When they share a rotation, which the caller has
+  /// established once at load, the activation is rotated once for all of them.
+  public static func project(
+    _ x: MLXArray, _ projections: [PackedLinear], sharingRotation: Bool
+  ) -> [MLXArray] {
+    guard sharingRotation, let first = projections.first else {
+      return projections.map { $0(x) }
     }
-
-    if BonsaiRuntime.useQMVWide {
-      let shape = h.shape
-      let width = shape[shape.count - 1]
-      let rows = h.size / width
-      if QMVWide.supportedBatch.contains(rows),
-        let y = QMVWide.apply(
-          h.reshaped([rows, width]), weight, scales: scales, biases: biases,
-          groupSize: groupSize, bits: bits)
-      {
-        return y.reshaped(Array(shape.dropLast()) + [outputDim])
-      }
-    }
-
-    return quantized(h)
+    let rotated = first.rotate(x)
+    return projections.map { $0.applyRotated(rotated) }
   }
 
   private func quantized(_ h: MLXArray) -> MLXArray {
@@ -233,7 +215,7 @@ public final class PackedLinear: @unchecked Sendable {
   // A split projection rotates its input once and hands the same activation to both halves, so
   // the rotation and the matmul are reachable on their own.
   public func rotate(_ x: MLXArray) -> MLXArray {
-    guard block > 0, let signs else { return x }
+    guard ggml == nil, exl3 == nil, block > 0, let signs else { return x }
     if BonsaiRuntime.useFusedHadamard,
       let fused = FusedHadamard.apply(x, block: block, signs: signs)
     {
@@ -246,7 +228,20 @@ public final class PackedLinear: @unchecked Sendable {
     if let ggml { return ggmlApply(h, ggml) }
     if let exl3 { return EXL3Kernels.apply(h, exl3) }
     if isDense {
+      collect?(h)
       return matmul(h, weight.T.asType(h.dtype))
+    }
+    if BonsaiRuntime.useQMVWide {
+      let shape = h.shape
+      let width = shape[shape.count - 1]
+      let rows = h.size / width
+      if QMVWide.supportedBatch.contains(rows),
+        let y = QMVWide.apply(
+          h.reshaped([rows, width]), weight, scales: scales, biases: biases,
+          groupSize: groupSize, bits: bits)
+      {
+        return y.reshaped(Array(shape.dropLast()) + [outputDim])
+      }
     }
     return quantized(h)
   }

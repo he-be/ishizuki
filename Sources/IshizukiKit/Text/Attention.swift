@@ -11,8 +11,9 @@ public final class Attention: @unchecked Sendable {
   private let kProj: PackedLinear
   private let vProj: PackedLinear
   private let oProj: PackedLinear
-  private let qNorm: MLXArray
-  private let kNorm: MLXArray
+  private let sharedRotation: Bool
+  private let qNorm: CastWeight
+  private let kNorm: CastWeight
   private let rope: RotaryEmbedding
 
   private let numHeads: Int
@@ -49,8 +50,9 @@ public final class Attention: @unchecked Sendable {
     self.kProj = try factory.linear(prefix + ".k_proj")
     self.vProj = try factory.linear(prefix + ".v_proj")
     self.oProj = try factory.linear(prefix + ".o_proj")
-    self.qNorm = try store(tensorPrefix + ".q_norm.weight")
-    self.kNorm = try store(tensorPrefix + ".k_norm.weight")
+    self.sharedRotation = sharesRotation(qProj, kProj) && sharesRotation(qProj, vProj)
+    self.qNorm = CastWeight(try store(tensorPrefix + ".q_norm.weight"))
+    self.kNorm = CastWeight(try store(tensorPrefix + ".k_norm.weight"))
 
     if let budget = config.indexerBudget, budget < config.maxPositionEmbeddings,
       store.has(tensorPrefix + ".indexer.index_qk_proj.weight")
@@ -71,20 +73,21 @@ public final class Attention: @unchecked Sendable {
     var queries: MLXArray
     var gate: MLXArray?
 
+    let qkv = PackedLinear.project(x, [qProj, kProj, vProj], sharingRotation: sharedRotation)
     if outputGate {
-      let projected = qProj(x).reshaped([b, l, numHeads, 2 * headDim])
+      let projected = qkv[0].reshaped([b, l, numHeads, 2 * headDim])
       queries = projected[0..., 0..., 0..., ..<headDim]
       gate = projected[0..., 0..., 0..., headDim...].reshaped([b, l, numHeads * headDim])
     } else {
-      queries = qProj(x).reshaped([b, l, numHeads, headDim])
+      queries = qkv[0].reshaped([b, l, numHeads, headDim])
     }
 
-    var keys = kProj(x).reshaped([b, l, numKeyValueHeads, headDim])
-    var values = vProj(x).reshaped([b, l, numKeyValueHeads, headDim])
+    var keys = qkv[1].reshaped([b, l, numKeyValueHeads, headDim])
+    var values = qkv[2].reshaped([b, l, numKeyValueHeads, headDim])
 
-    queries = MLXFast.rmsNorm(queries, weight: qNorm.asType(queries.dtype), eps: normEps)
+    queries = MLXFast.rmsNorm(queries, weight: qNorm(queries.dtype), eps: normEps)
       .transposed(0, 2, 1, 3)
-    keys = MLXFast.rmsNorm(keys, weight: kNorm.asType(keys.dtype), eps: normEps)
+    keys = MLXFast.rmsNorm(keys, weight: kNorm(keys.dtype), eps: normEps)
       .transposed(0, 2, 1, 3)
     values = values.transposed(0, 2, 1, 3)
 
@@ -205,6 +208,7 @@ public final class MLP: @unchecked Sendable {
   private let gateProj: PackedLinear
   private let upProj: PackedLinear
   private let downProj: PackedLinear
+  private let sharedRotation: Bool
   private let split: Split?
 
   private struct Split {
@@ -225,6 +229,7 @@ public final class MLP: @unchecked Sendable {
     self.gateProj = try factory.linear(prefix + ".gate_proj")
     self.upProj = try factory.linear(prefix + ".up_proj")
     self.downProj = try factory.linear(prefix + ".down_proj")
+    self.sharedRotation = sharesRotation(gateProj, upProj)
     self.split = MLP.split(layer: layer, gate: gateProj, up: upProj)
   }
 
@@ -248,7 +253,8 @@ public final class MLP: @unchecked Sendable {
     if let split, x.ndim == 3, x.dim(0) * x.dim(1) == split.gate.rows {
       return hybrid(x, split)
     }
-    return downProj(silu(gateProj(x)) * upProj(x))
+    let gateUp = PackedLinear.project(x, [gateProj, upProj], sharingRotation: sharedRotation)
+    return downProj(silu(gateUp[0]) * gateUp[1])
   }
 
   private func hybrid(_ x: MLXArray, _ split: Split) -> MLXArray {
