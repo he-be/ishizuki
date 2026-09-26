@@ -28,6 +28,7 @@ let package = Package(
         .product(name: "MLXNN", package: "mlx-swift"),
         .product(name: "MLXFast", package: "mlx-swift"),
         .product(name: "MLXRandom", package: "mlx-swift"),
+        .product(name: "MLXOptimizers", package: "mlx-swift"),
         .product(name: "Jinja", package: "swift-jinja"),
         .product(name: "OrderedCollections", package: "swift-collections"),
       ]
