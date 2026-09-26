@@ -213,6 +213,8 @@ public struct PackedModuleFactory {
   /// that what it measures is the architecture rather than the rounding.
   public let activationDType: DType
   private let collector: ActivationCollector?
+  /// Every projection this factory has handed out, by module path.
+  public let built = LinearRegistry()
 
   public init(
     store: WeightStore, config: BonsaiConfig, tensorPrefix: String,
@@ -305,6 +307,12 @@ public struct PackedModuleFactory {
   }
 
   private func packedLinear(_ path: String, block: Int) throws -> PackedLinear {
+    let linear = try unregisteredLinear(path, block: block)
+    built.record(path, linear)
+    return linear
+  }
+
+  private func unregisteredLinear(_ path: String, block: Int) throws -> PackedLinear {
     let key = tensorPrefix + path
     if let blocks = store.ggml(key + ".weight") {
       return PackedLinear(ggml: blocks)
@@ -327,6 +335,17 @@ public struct PackedModuleFactory {
       groupSize: entry.groupSize,
       bits: entry.bits)
   }
+}
+
+public final class LinearRegistry: @unchecked Sendable {
+  private let lock = NSLock()
+  private var linears: [String: PackedLinear] = [:]
+
+  func record(_ path: String, _ linear: PackedLinear) {
+    lock.withLock { linears[path] = linear }
+  }
+
+  public var all: [String: PackedLinear] { lock.withLock { linears } }
 }
 
 /// A linear layer, however its weights happen to be stored.

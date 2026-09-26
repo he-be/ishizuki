@@ -41,6 +41,10 @@ public enum ANEOffload: Equatable, Sendable {
 }
 
 public enum BonsaiRuntime {
+  /// Routes every projection and the delta rule through ops autodiff can trace, which the fused
+  /// kernels are not. Training sets it; nothing else should.
+  public nonisolated(unsafe) static var differentiable = false
+
   public nonisolated(unsafe) static var useFusedHadamard = false
 
   public nonisolated(unsafe) static var useQMVWide = false

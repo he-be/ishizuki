@@ -98,14 +98,14 @@ public final class GatedDeltaNet: @unchecked Sendable {
     // convolution and the delta rule rather than after them.
     var zPending: ANESlice.Pending?
     var zTail: MLXArray?
-    if let zSplit, b * s == zSplit.slice.rows {
+    if let zSplit, !BonsaiRuntime.differentiable, b * s == zSplit.slice.rows {
       let rotated = inProjZ.rotate(x.reshaped([b * s, x.dim(2)]))
       zPending = zSplit.slice.dispatch(rotated)
       zTail = zSplit.tail.applyRotated(rotated)
     }
 
     let shared = zPending == nil && sharedRotation ? inProjQKV.rotate(x) : nil
-    let qkv = shared.map { inProjQKV.applyRotated($0) } ?? inProjQKV(x)
+    let qkv = shared.map { inProjQKV.applyRotated($0, input: x) } ?? inProjQKV(x)
     let aRaw = inProjA(x)
     let bRaw = inProjB(x)
 
@@ -157,7 +157,7 @@ public final class GatedDeltaNet: @unchecked Sendable {
         .reshaped([b, s, numValueHeads, valueHeadDim])
     }
     let zValue =
-      z ?? (shared.map { inProjZ.applyRotated($0) } ?? inProjZ(x))
+      z ?? (shared.map { inProjZ.applyRotated($0, input: x) } ?? inProjZ(x))
       .reshaped([b, s, numValueHeads, valueHeadDim])
 
     let normalized = MLXFast.rmsNorm(y, weight: normWeight(y.dtype), eps: normEps)
@@ -173,7 +173,9 @@ public final class GatedDeltaNet: @unchecked Sendable {
     state: MLXArray, headRepeat: Int, layout: ValueHeadLayout = .grouped
   ) -> (MLXArray, MLXArray) {
     #if !targetEnvironment(simulator)
-      if Device.defaultDevice().deviceType == .gpu, let kernel = metalKernel {
+      if Device.defaultDevice().deviceType == .gpu, !BonsaiRuntime.differentiable,
+        let kernel = metalKernel
+      {
         let outputs = kernel(
           [q, k, v, g, beta, state, q.dim(1)],
           template: [

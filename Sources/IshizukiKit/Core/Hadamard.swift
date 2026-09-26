@@ -46,6 +46,9 @@ public final class PackedLinear: @unchecked Sendable {
   public let inputDim: Int
   public let outputDim: Int
 
+  /// A low-rank update read from the unrotated input and added to the base projection.
+  public var lora: LoRA?
+
   public init(
     weight: MLXArray, scales: MLXArray, biases: MLXArray,
     signs: MLXArray?, block: Int, groupSize: Int = 128, bits: Int = 2
@@ -148,7 +151,7 @@ public final class PackedLinear: @unchecked Sendable {
     let width = shape[shape.count - 1]
     let rows = h.size / width
 
-    if BonsaiRuntime.useVerifyMatmul, (5...16).contains(rows) {
+    if BonsaiRuntime.useVerifyMatmul, !BonsaiRuntime.differentiable, (5...16).contains(rows) {
       let x = h.reshaped([rows, width])
       let pieces = stride(from: 0, to: rows, by: 8).map { start in
         GGMLKernels.matmulFew(
@@ -161,7 +164,7 @@ public final class PackedLinear: @unchecked Sendable {
       }
     }
 
-    if GGMLKernels.matvecBatch.contains(rows),
+    if !BonsaiRuntime.differentiable, GGMLKernels.matvecBatch.contains(rows),
       let y = GGMLKernels.matvec(
         h.reshaped([rows, width]), blocks: blocks.bytes, type: blocks.type,
         outputDim: blocks.outputDim)
@@ -179,7 +182,13 @@ public final class PackedLinear: @unchecked Sendable {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    applyRotated(rotate(x))
+    applyRotated(rotate(x), input: x)
+  }
+
+  public func applyRotated(_ h: MLXArray, input x: MLXArray) -> MLXArray {
+    let y = applyRotated(h)
+    guard let lora else { return y }
+    return y + lora(x).asType(y.dtype)
   }
 
   /// Several projections of one activation. When they share a rotation, which the caller has
@@ -191,11 +200,11 @@ public final class PackedLinear: @unchecked Sendable {
       return projections.map { $0(x) }
     }
     let rotated = first.rotate(x)
-    return projections.map { $0.applyRotated(rotated) }
+    return projections.map { $0.applyRotated(rotated, input: x) }
   }
 
   private func quantized(_ h: MLXArray) -> MLXArray {
-    if BonsaiRuntime.useVerifyMatmul {
+    if BonsaiRuntime.useVerifyMatmul, !BonsaiRuntime.differentiable {
       let shape = h.shape
       let width = shape[shape.count - 1]
       let rows = h.size / width
@@ -216,7 +225,7 @@ public final class PackedLinear: @unchecked Sendable {
   // the rotation and the matmul are reachable on their own.
   public func rotate(_ x: MLXArray) -> MLXArray {
     guard ggml == nil, exl3 == nil, block > 0, let signs else { return x }
-    if BonsaiRuntime.useFusedHadamard,
+    if BonsaiRuntime.useFusedHadamard, !BonsaiRuntime.differentiable,
       let fused = FusedHadamard.apply(x, block: block, signs: signs)
     {
       return fused
@@ -226,12 +235,15 @@ public final class PackedLinear: @unchecked Sendable {
 
   public func applyRotated(_ h: MLXArray) -> MLXArray {
     if let ggml { return ggmlApply(h, ggml) }
-    if let exl3 { return EXL3Kernels.apply(h, exl3) }
+    if let exl3 {
+      precondition(!BonsaiRuntime.differentiable, "EXL3 projections have no backward pass yet")
+      return EXL3Kernels.apply(h, exl3)
+    }
     if isDense {
       collect?(h)
       return matmul(h, weight.T.asType(h.dtype))
     }
-    if BonsaiRuntime.useQMVWide {
+    if BonsaiRuntime.useQMVWide, !BonsaiRuntime.differentiable {
       let shape = h.shape
       let width = shape[shape.count - 1]
       let rows = h.size / width

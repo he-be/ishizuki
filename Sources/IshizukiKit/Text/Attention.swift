@@ -250,7 +250,7 @@ public final class MLP: @unchecked Sendable {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    if let split, x.ndim == 3, x.dim(0) * x.dim(1) == split.gate.rows {
+    if let split, !BonsaiRuntime.differentiable, x.ndim == 3, x.dim(0) * x.dim(1) == split.gate.rows {
       return hybrid(x, split)
     }
     let gateUp = PackedLinear.project(x, [gateProj, upProj], sharingRotation: sharedRotation)

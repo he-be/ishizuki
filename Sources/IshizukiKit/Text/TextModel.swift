@@ -174,6 +174,8 @@ public final class TextModel: @unchecked Sendable {
   private let engrams: EngramStore?
   private let hasher: NgramHasher?
   public let lmHead: PackedLinear
+  /// The model's projections by module path, the head included — what an adapter attaches to.
+  public let linears: [String: PackedLinear]
   public let rope: RotaryEmbedding
   private let eps: Float
 
@@ -232,6 +234,7 @@ public final class TextModel: @unchecked Sendable {
     } else {
       self.lmHead = try factory.linear("lm_head")
     }
+    self.linears = factory.built.all
   }
 
   public func hidden(
