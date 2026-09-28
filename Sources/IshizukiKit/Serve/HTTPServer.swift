@@ -154,8 +154,8 @@ public final class HTTPServer: @unchecked Sendable {
   /// A plain TCP listener by default. A key makes every connection TLS with that pre-shared
   /// key, and a service name has the listener answer Bonjour browses for itself.
   public init(
-    port: UInt16, psk: PreSharedKey? = nil, advertise: BonjourService? = nil,
-    handler: @escaping Handler
+    port: UInt16, host: String? = nil, psk: PreSharedKey? = nil,
+    advertise: BonjourService? = nil, handler: @escaping Handler
   ) throws {
     let parameters: NWParameters
     if let psk {
@@ -167,7 +167,14 @@ public final class HTTPServer: @unchecked Sendable {
     guard let nwPort = NWEndpoint.Port(rawValue: port) else {
       throw BonsaiError.unsupportedModel("invalid port \(port)")
     }
-    self.listener = try NWListener(using: parameters, on: nwPort)
+    if let host {
+      // Only connections to this address are accepted (tsugumi: 127.0.0.1, reached over an
+      // ssh forward, so the unauthenticated API never listens on the LAN).
+      parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(host), port: nwPort)
+      self.listener = try NWListener(using: parameters)
+    } else {
+      self.listener = try NWListener(using: parameters, on: nwPort)
+    }
     if let advertise { listener.service = advertise.service }
     self.handler = handler
   }

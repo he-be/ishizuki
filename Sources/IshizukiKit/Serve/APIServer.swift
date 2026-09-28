@@ -211,8 +211,8 @@ public final class APIServer: @unchecked Sendable {
     return model
   }
 
-  public func listen(port: UInt16) throws {
-    let server = try HTTPServer(port: port) { [weak self] request, writer in
+  public func listen(port: UInt16, host: String? = nil) throws {
+    let server = try HTTPServer(port: port, host: host) { [weak self] request, writer in
       guard let self else { return }
       let id = self.stats.enqueue(for: request.path)
       self.generationQueue.async { self.route(request, writer, id) }
