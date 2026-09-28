@@ -36,6 +36,11 @@ public final class APIServer: @unchecked Sendable {
   let generationQueue = DispatchQueue(label: "bonsai.generate")
   private var server: HTTPServer?
   public var log: (@Sendable (String) -> Void)?
+  /// The context a request may fill, prompt and reply together, as llama-server's `n_ctx`: a
+  /// longer prompt is refused with `exceed_context_size_error`, and a reply stops at the limit
+  /// with `finish_reason` "length". nil leaves both unbounded (the app's behaviour). Reported by
+  /// `GET /props`.
+  public var contextLimit: Int?
 
   /// The high-water mark a readout reports, kept here so every reader sees the same peak.
   var peakHeld = 0
@@ -264,6 +269,17 @@ public final class APIServer: @unchecked Sendable {
       writer.send(json: ["object": "list", "data": data])
     case ("POST", "/v1/chat/completions"):
       handleOpenAI(request, writer, id)
+    case ("POST", "/v1/completions"), ("POST", "/completion"):
+      handleCompletion(request, writer, id)
+    case ("POST", "/apply-template"):
+      handleApplyTemplate(request, writer)
+    case ("POST", "/tokenize"):
+      handleTokenize(request, writer)
+    case ("GET", "/props"):
+      writer.send(json: [
+        "default_generation_settings": ["n_ctx": contextLimit ?? RopeScaling.none.effectiveContext],
+        "model_alias": modelName, "model_path": modelPath.path,
+      ])
     case ("POST", "/v1/messages"):
       handleAnthropic(request, writer, id)
     case ("POST", "/v1/messages/count_tokens"):
@@ -292,6 +308,29 @@ public final class APIServer: @unchecked Sendable {
     var effort: ReasoningEffort?
     /// The conversation this belongs to, carried onto the cache slot and any archive of it.
     var tag: String? = nil
+    /// Per-request sampler overrides, as llama-server reads them; nil keeps the server's own.
+    var topK: Int? = nil
+    var topP: Float? = nil
+    var minP: Float? = nil
+    var presencePenalty: Float? = nil
+    var seed: UInt64? = nil
+    /// Token ids never drawn (`logit_bias` of -100 or `false`).
+    var bannedTokens: [Int] = []
+    /// An already rendered prompt, continued as it is (`/v1/completions`): no template, no
+    /// reasoning split, no tool-call parsing. The text comes back verbatim.
+    var rawPrompt: String? = nil
+    /// Strings that end a raw completion; the match and what follows are cut off.
+    var stop: [String] = []
+  }
+
+  /// A prompt longer than `contextLimit`, reported the way llama-server does so a client that
+  /// handles its overflow handles this one.
+  struct ContextOverflow: Error, CustomStringConvertible {
+    let promptTokens: Int
+    let limit: Int
+    var description: String {
+      "the request exceeds the available context size (\(promptTokens) prompt tokens, n_ctx \(limit))"
+    }
   }
 
   func complete(
@@ -304,22 +343,32 @@ public final class APIServer: @unchecked Sendable {
     onToolText: ((String) -> Void)? = nil
   ) throws -> (
     parsed: ParsedCompletion, promptTokens: Int, completionTokens: Int, cancelled: Bool,
-    tokens: [Int], reused: Int
+    tokens: [Int], reused: Int, finish: String, stats: GenerationStats, options: SamplingOptions
   ) {
     residency.beginRequest()
     defer { residency.endRequest() }
 
     activateIfRequested(request.model)
     let model = try self.model()
-    let rendered = try template.render(
-      messages: request.messages,
-      addGenerationPrompt: true,
-      enableThinking: request.thinking,
-      reasoningEffort: request.effort,
-      tools: request.tools, orderedTools: request.orderedTools)
+    let raw = request.rawPrompt != nil
+    let rendered =
+      try request.rawPrompt
+      ?? template.render(
+        messages: request.messages,
+        addGenerationPrompt: true,
+        enableThinking: request.thinking,
+        reasoningEffort: request.effort,
+        tools: request.tools, orderedTools: request.orderedTools)
 
     stats.enter(id, phase: .prefill)
     var promptTokens = model.tokenizer.encode(rendered)
+    var maxTokens = request.maxTokens
+    if let limit = contextLimit {
+      guard promptTokens.count < limit else {
+        throw ContextOverflow(promptTokens: promptTokens.count, limit: limit)
+      }
+      maxTokens = min(maxTokens, limit - promptTokens.count)
+    }
     var embeddings: MLXArray?
     var positions: MLXArray?
     if !request.images.isEmpty {
@@ -337,8 +386,19 @@ public final class APIServer: @unchecked Sendable {
 
     var options = samplingOptions
     if let temperature = request.temperature { options.temperature = temperature }
+    if let topK = request.topK { options.topK = topK }
+    if let topP = request.topP { options.topP = topP }
+    if let minP = request.minP { options.minP = min(max(minP, 0), 1) }
+    if let presencePenalty = request.presencePenalty { options.presencePenalty = presencePenalty }
+    if let seed = request.seed { options.seed = seed }
+    if !request.bannedTokens.isEmpty {
+      if let bad = request.bannedTokens.first(where: { model.tokenizer.tokenString($0) == nil }) {
+        throw BonsaiError.unsupportedModel("logit_bias names token \(bad), which is not in the vocabulary")
+      }
+      options.bannedTokens = request.bannedTokens
+    }
 
-    applyBudget(budget.observe(contextTokens: promptTokens.count + request.maxTokens))
+    applyBudget(budget.observe(contextTokens: promptTokens.count + maxTokens))
 
     var cache: ModelCache?
     var reused = 0
@@ -360,7 +420,7 @@ public final class APIServer: @unchecked Sendable {
     stats.update(id) { record in
       record.promptTokens = promptTokens.count
       record.cachedTokens = reused
-      record.maxTokens = request.maxTokens
+      record.maxTokens = maxTokens
     }
 
     var constraint: OutputConstraint?
@@ -374,9 +434,11 @@ public final class APIServer: @unchecked Sendable {
       model: model, kvConfig: kvConfig, politeness: politeness)
 
     let opened =
-      request.thinking
+      !raw && request.thinking
       && rendered.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("<think>")
     var filter = StreamFilter(thinking: opened)
+    var rawText = ""
+    var hitStop = false
 
     let promptLease = lease
     // A rewind point a few tokens short of the end, which is where the next prompt parts ways.
@@ -388,7 +450,7 @@ public final class APIServer: @unchecked Sendable {
       ? promptTokens.count - rewindReserve : nil
     let result = try withError { box in
       generator.generate(
-        promptTokens: promptTokens, options: options, maxTokens: request.maxTokens,
+        promptTokens: promptTokens, options: options, maxTokens: maxTokens,
         cache: cache, promptEmbeddings: embeddings, positions: positions,
         cachedPrefixLength: reused,
         constraint: constraint,
@@ -420,6 +482,23 @@ public final class APIServer: @unchecked Sendable {
           }
         }
       ) { fragment in
+        if raw {
+          rawText += fragment
+          // Searched from a little before the new fragment, so a stop split across two
+          // fragments is still found.
+          let from = rawText.index(
+            rawText.endIndex,
+            offsetBy: -(fragment.count + (request.stop.map(\.count).max() ?? 0)),
+            limitedBy: rawText.startIndex) ?? rawText.startIndex
+          if let hit = request.stop.compactMap({ rawText.range(of: $0, range: from..<rawText.endIndex) })
+            .min(by: { $0.lowerBound < $1.lowerBound })
+          {
+            rawText = String(rawText[..<hit.lowerBound])
+            hitStop = true
+            return false
+          }
+          return true
+        }
         let piece = filter.push(fragment)
         if let thought = piece.reasoning { onReasoning?(thought) }
         if let visible = piece.content { onText?(visible) }
@@ -428,7 +507,7 @@ public final class APIServer: @unchecked Sendable {
         return true
       }
     }
-    if !result.cancelled {
+    if !result.cancelled, !raw {
       let tail = filter.flush()
       if let thought = tail.reasoning { onReasoning?(thought) }
       if let visible = tail.content { onText?(visible) }
@@ -446,10 +525,19 @@ public final class APIServer: @unchecked Sendable {
       stats.record(id, generation: result.stats, cached: reused, reused: reused > 0)
     }
 
-    let raw = opened ? "<think>" + result.text : result.text
+    // "length" only when the budget ran out: an end-of-turn token, a stop string or an
+    // exhausted schema all read as "stop".
+    let finish =
+      !hitStop && !result.stoppedOnEOS && result.tokens.count >= maxTokens ? "length" : "stop"
+    let parsed =
+      raw
+      ? ParsedCompletion(reasoning: nil, content: rawText, toolCalls: [])
+      : ToolCallParser.parse(
+        opened ? "<think>" + result.text : result.text,
+        types: ToolCallParser.parameterTypes(request.tools))
     return (
-      ToolCallParser.parse(raw, types: ToolCallParser.parameterTypes(request.tools)),
-      promptTokens.count, result.tokens.count, result.cancelled, promptTokens, reused
+      parsed, promptTokens.count, result.tokens.count, result.cancelled, promptTokens, reused,
+      finish, result.stats, options
     )
   }
 
@@ -543,6 +631,62 @@ public final class APIServer: @unchecked Sendable {
     return (tokens.count, lease.reused, result.cancelled)
   }
 
+  /// llama-server's `timings` object, which the Tsugumi client reads for its diagnostics.
+  static func timings(reused: Int, stats: GenerationStats) -> [String: Any] {
+    [
+      "cache_n": reused,
+      "prompt_n": stats.promptTokens,
+      "prompt_ms": stats.promptSeconds * 1000,
+      "prompt_per_second": stats.promptTokensPerSecond,
+      "predicted_n": stats.generatedTokens,
+      "predicted_ms": stats.generationSeconds * 1000,
+      "predicted_per_second": stats.generationTokensPerSecond,
+    ]
+  }
+
+  /// The sampler a request actually ran with, as llama-server's `generation_settings`.
+  static func generationSettings(_ options: SamplingOptions) -> [String: Any] {
+    var settings: [String: Any] = [
+      "temperature": options.temperature, "top_k": options.topK, "top_p": options.topP,
+      "min_p": options.minP, "presence_penalty": options.presencePenalty,
+      "repeat_penalty": options.repetitionPenalty, "repeat_last_n": options.repetitionContext,
+      "banned_tokens": options.bannedTokens,
+    ]
+    if let seed = options.seed { settings["seed"] = seed }
+    return settings
+  }
+
+  /// The failure of a request that has not begun its reply, with a context overflow in
+  /// llama-server's shape.
+  private func sendFailure(_ writer: ResponseWriter, _ error: Error) {
+    if let overflow = error as? ContextOverflow, !writer.hasBegun {
+      log?("request refused: \(overflow)")
+      writer.send(
+        status: 400,
+        json: [
+          "error": [
+            "code": 400, "type": "exceed_context_size_error", "message": overflow.description,
+            "n_prompt_tokens": overflow.promptTokens, "n_ctx": overflow.limit,
+          ]
+        ])
+      return
+    }
+    fail(writer, error)
+  }
+
+  /// Renders and counts a request's prompt before any reply is committed, so an overflow is a
+  /// 400 rather than an error inside a stream that has already said 200.
+  private func checkContext(_ request: Request) throws {
+    guard let limit = contextLimit, request.images.isEmpty else { return }
+    let rendered =
+      try request.rawPrompt
+      ?? template.render(
+        messages: request.messages, addGenerationPrompt: true, enableThinking: request.thinking,
+        reasoningEffort: request.effort, tools: request.tools, orderedTools: request.orderedTools)
+    let count = try model().tokenizer.encode(rendered).count
+    if count >= limit { throw ContextOverflow(promptTokens: count, limit: limit) }
+  }
+
   private func handleOpenAI(
     _ request: HTTPRequest, _ writer: ResponseWriter, _ id: Int? = nil
   ) {
@@ -555,13 +699,16 @@ public final class APIServer: @unchecked Sendable {
       var parsed = try parseOpenAI(body)
       parsed.orderedTools = Self.orderedTools(request.body, anthropic: false)
       stats.update(id) { $0.stream = parsed.stream }
+      try checkContext(parsed)
       let identifier = "chatcmpl-" + UUID().uuidString.prefix(12)
       let created = Int(Date().timeIntervalSince1970)
 
       if parsed.stream {
         writer.beginEventStream()
-        func chunk(_ delta: [String: Any], finish: String? = nil) {
-          writer.sendEvent(data: [
+        func chunk(
+          _ delta: [String: Any], finish: String? = nil, extra: [String: Any] = [:]
+        ) {
+          var event: [String: Any] = [
             "id": identifier, "object": "chat.completion.chunk", "created": created,
             "model": modelName,
             "choices": [
@@ -570,7 +717,9 @@ public final class APIServer: @unchecked Sendable {
                 "finish_reason": finish as Any? ?? NSNull(),
               ]
             ],
-          ])
+          ]
+          event.merge(extra) { $1 }
+          writer.sendEvent(data: event)
         }
         chunk(["role": "assistant", "content": ""])
 
@@ -601,7 +750,17 @@ public final class APIServer: @unchecked Sendable {
             ])
           }
         }
-        chunk([:], finish: completion.parsed.toolCalls.isEmpty ? "stop" : "tool_calls")
+        chunk(
+          [:], finish: completion.parsed.toolCalls.isEmpty ? completion.finish : "tool_calls",
+          extra: [
+            "timings": Self.timings(reused: completion.reused, stats: completion.stats),
+            "generation_settings": Self.generationSettings(completion.options),
+            "usage": [
+              "prompt_tokens": completion.promptTokens,
+              "completion_tokens": completion.completionTokens,
+              "total_tokens": completion.promptTokens + completion.completionTokens,
+            ],
+          ])
         writer.sendRaw("data: [DONE]\n\n")
         writer.finish()
         return
@@ -635,7 +794,7 @@ public final class APIServer: @unchecked Sendable {
           [
             "index": 0, "message": message,
             "finish_reason": completion.parsed.toolCalls.isEmpty
-              ? "stop" : "tool_calls",
+              ? completion.finish : "tool_calls",
           ]
         ],
         "usage": [
@@ -643,10 +802,135 @@ public final class APIServer: @unchecked Sendable {
           "completion_tokens": completion.completionTokens,
           "total_tokens": completion.promptTokens + completion.completionTokens,
         ],
+        "timings": Self.timings(reused: completion.reused, stats: completion.stats),
+        "generation_settings": Self.generationSettings(completion.options),
       ])
     } catch {
-      writer.sendError(
-        status: 400, type: "invalid_request_error", message: "\(error)")
+      sendFailure(writer, error)
+    }
+  }
+
+  /// `/v1/completions`, llama-server style: `prompt` is already rendered and is continued as it
+  /// is, up to `max_tokens`, an end-of-turn token or one of `stop`. Not streamed.
+  private func handleCompletion(
+    _ request: HTTPRequest, _ writer: ResponseWriter, _ id: Int? = nil
+  ) {
+    guard let body = request.json() else {
+      writer.sendError(status: 400, type: "invalid_request_error", message: "invalid JSON")
+      return
+    }
+    do {
+      guard let prompt = body["prompt"] as? String, !prompt.isEmpty else {
+        throw BonsaiError.unsupportedModel("prompt must be a non-empty string")
+      }
+      if body["stream"] as? Bool == true {
+        throw BonsaiError.unsupportedModel("streamed completions are not supported")
+      }
+      if body["grammar"] != nil {
+        throw BonsaiError.unsupportedModel("GBNF grammars are not supported")
+      }
+      let stop: [String] =
+        (body["stop"] as? [String]) ?? (body["stop"] as? String).map { [$0] } ?? []
+      var parsed = Request(
+        messages: [], tools: nil,
+        maxTokens: (body["max_tokens"] as? Int) ?? (body["n_predict"] as? Int) ?? 1024,
+        temperature: (body["temperature"] as? NSNumber)?.floatValue,
+        stream: false, thinking: false, images: [], responseSchema: nil,
+        model: body["model"] as? String)
+      try Self.readSampling(body, into: &parsed)
+      parsed.rawPrompt = prompt
+      parsed.stop = stop.filter { !$0.isEmpty }
+      try checkContext(parsed)
+      let completion = try complete(parsed, id: id, isCancelled: { writer.isCancelled })
+      if completion.cancelled {
+        writer.finish()
+        return
+      }
+      writer.send(json: [
+        "id": "cmpl-" + UUID().uuidString.prefix(12), "object": "text_completion",
+        "created": Int(Date().timeIntervalSince1970), "model": modelName,
+        "choices": [
+          ["index": 0, "text": completion.parsed.content, "finish_reason": completion.finish]
+        ],
+        "usage": [
+          "prompt_tokens": completion.promptTokens,
+          "completion_tokens": completion.completionTokens,
+          "total_tokens": completion.promptTokens + completion.completionTokens,
+        ],
+        "timings": Self.timings(reused: completion.reused, stats: completion.stats),
+        "generation_settings": Self.generationSettings(completion.options),
+      ])
+    } catch {
+      sendFailure(writer, error)
+    }
+  }
+
+  /// `/apply-template`: the prompt a chat request would be continued from, as text.
+  private func handleApplyTemplate(_ request: HTTPRequest, _ writer: ResponseWriter) {
+    guard let body = request.json() else {
+      writer.sendError(status: 400, type: "invalid_request_error", message: "invalid JSON")
+      return
+    }
+    do {
+      var parsed = try parseOpenAI(body)
+      parsed.orderedTools = Self.orderedTools(request.body, anthropic: false)
+      let prompt = try template.render(
+        messages: parsed.messages, addGenerationPrompt: true, enableThinking: parsed.thinking,
+        reasoningEffort: parsed.effort, tools: parsed.tools, orderedTools: parsed.orderedTools)
+      writer.send(json: ["prompt": prompt])
+    } catch {
+      sendFailure(writer, error)
+    }
+  }
+
+  /// `/tokenize`: `content` as token ids; `parse_special` reads added tokens such as
+  /// `<tool_call>` as themselves rather than as their characters.
+  private func handleTokenize(_ request: HTTPRequest, _ writer: ResponseWriter) {
+    guard let body = request.json(), let content = body["content"] as? String else {
+      writer.sendError(status: 400, type: "invalid_request_error", message: "content is required")
+      return
+    }
+    do {
+      let tokens = try model().tokenizer.encode(
+        content, addSpecialTokens: body["parse_special"] as? Bool ?? false)
+      writer.send(json: ["tokens": tokens])
+    } catch {
+      sendFailure(writer, error)
+    }
+  }
+
+  /// The sampler fields llama-server takes per request, and `logit_bias` as a ban: either
+  /// `[[id, false]]` / `[[id, -100]]` or OpenAI's `{"id": -100}`. Any other bias is refused
+  /// rather than silently ignored, since only the ban is implemented.
+  static func readSampling(_ body: [String: Any], into request: inout Request) throws {
+    request.topK = (body["top_k"] as? NSNumber)?.intValue
+    request.topP = (body["top_p"] as? NSNumber)?.floatValue
+    request.minP = (body["min_p"] as? NSNumber)?.floatValue
+    request.presencePenalty = (body["presence_penalty"] as? NSNumber)?.floatValue
+    if let seed = (body["seed"] as? NSNumber)?.int64Value, seed >= 0 {
+      request.seed = UInt64(seed)
+    }
+    var pairs: [(Any?, Any?)] = []
+    if let list = body["logit_bias"] as? [[Any]] {
+      pairs = list.map { ($0.first, $0.count > 1 ? $0[1] : nil) }
+    } else if let map = body["logit_bias"] as? [String: Any] {
+      pairs = map.map { ($0.key, $0.value) }
+    }
+    for (key, value) in pairs {
+      let id = (key as? NSNumber)?.intValue ?? (key as? String).flatMap { Int($0) }
+      let isBan: Bool
+      if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
+        isBan = !number.boolValue
+      } else if let number = value as? NSNumber {
+        isBan = number.doubleValue <= -100
+      } else {
+        isBan = false
+      }
+      guard let id, isBan else {
+        throw BonsaiError.unsupportedModel(
+          "logit_bias: only bans (false or -100 on a token id) are supported")
+      }
+      request.bannedTokens.append(id)
     }
   }
 
@@ -739,7 +1023,7 @@ public final class APIServer: @unchecked Sendable {
     }
     let schema = jsonSchema(from: body["response_format"])
 
-    return Request(
+    var request = Request(
       messages: messages, tools: tools,
       maxTokens: body["max_tokens"] as? Int ?? 1024,
       temperature: (body["temperature"] as? NSNumber)?.floatValue,
@@ -749,6 +1033,8 @@ public final class APIServer: @unchecked Sendable {
       images: images,
       responseSchema: schema,
       model: body["model"] as? String)
+    try Self.readSampling(body, into: &request)
+    return request
   }
 
   private func jsonSchema(from value: Any?) -> [String: Any]? {

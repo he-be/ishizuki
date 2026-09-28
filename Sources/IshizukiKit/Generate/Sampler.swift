@@ -16,6 +16,10 @@ public struct SamplingOptions: Sendable {
   /// regardless of how many times — unlike `repetitionPenalty`, which scales with recurrence.
   public var presencePenalty: Float
   public var seed: UInt64?
+  /// Tokens that are never drawn: their logits are set to -inf before any warper, on every
+  /// path that samples (plain, pipelined, a lookup draft's check). What a client's
+  /// `logit_bias` of -100 / `false` asks for.
+  public var bannedTokens: [Int] = []
 
   public init(
     temperature: Float = 0.7, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0,
@@ -37,9 +41,12 @@ public struct SamplingOptions: Sendable {
 
 public struct Sampler {
   public let options: SamplingOptions
+  private let banned: Set<Int>
+  private var bannedTokens: [Int] { options.bannedTokens }
 
   public init(options: SamplingOptions) {
     self.options = options
+    self.banned = Set(options.bannedTokens)
     if let seed = options.seed { MLXRandom.seed(seed) }
   }
 
@@ -63,10 +70,11 @@ public struct Sampler {
   /// Sample restricted to `allowed`, by gathering just those logits. The allowed set is small,
   /// so this is cheaper than masking the full vocabulary and keeps the warper chain intact.
   public func callAsFunction(_ logits: MLXArray, allowed: [Int]) -> Int? {
+    let allowed = bannedTokens.isEmpty ? allowed : allowed.filter { !banned.contains($0) }
     guard !allowed.isEmpty else { return nil }
     let indices = MLXArray(allowed.map { Int32($0) })
     let gathered = logits.reshaped([-1])[indices].reshaped([1, allowed.count])
-    let scores = truncatedScores(gathered)
+    let scores = truncatedScores(gathered, applyBan: false)
 
     guard options.temperature > 0 else {
       return allowed[scores.argMax(axis: -1).item(Int.self)]
@@ -76,9 +84,16 @@ public struct Sampler {
   }
 
   public func truncatedScores(
-    _ logits: MLXArray, recentTokens: [Int] = [], pending: MLXArray? = nil
+    _ logits: MLXArray, recentTokens: [Int] = [], pending: MLXArray? = nil,
+    applyBan: Bool = true
   ) -> MLXArray {
     var scores = logits.asType(.float32)
+
+    if applyBan, !bannedTokens.isEmpty {
+      let mask = MLXArray.zeros([scores.dim(-1)], dtype: scores.dtype)
+      mask[MLXArray(bannedTokens.map { Int32($0) })] = MLXArray(-Float.infinity)
+      scores = scores + mask
+    }
 
     if let window = window(recentTokens, pending: pending) {
       if options.repetitionPenalty != 1.0 {
