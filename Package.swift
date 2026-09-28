@@ -14,6 +14,12 @@ let package = Package(
     .library(name: "IshizukiKit", targets: ["IshizukiKit"]),
     .library(name: "IshizukiAgent", targets: ["IshizukiAgent"]),
     .library(name: "IshizukiLink", targets: ["IshizukiLink"]),
+    // Headless tools for a Mac without the menu bar app (turbo-fieldfare bench/m6/ishizuki-driver):
+    // the OpenAI-compatible server, a prefill driver, and two probes of the MTP verify.
+    .executable(name: "ishizuki-serve", targets: ["IshizukiServe"]),
+    .executable(name: "ishizuki-prefill", targets: ["IshizukiPrefill"]),
+    .executable(name: "ishizuki-verify-bench", targets: ["IshizukiVerifyBench"]),
+    .executable(name: "ishizuki-decode-probe", targets: ["IshizukiDecodeProbe"]),
   ],
   dependencies: [
     .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.6"),
@@ -43,6 +49,22 @@ let package = Package(
     .target(
       name: "IshizukiLink",
       dependencies: ["IshizukiKit"]
+    ),
+    .executableTarget(
+      name: "IshizukiServe",
+      dependencies: ["IshizukiKit"]
+    ),
+    .executableTarget(
+      name: "IshizukiPrefill",
+      dependencies: ["IshizukiKit", .product(name: "MLX", package: "mlx-swift")]
+    ),
+    .executableTarget(
+      name: "IshizukiVerifyBench",
+      dependencies: ["IshizukiKit", .product(name: "MLX", package: "mlx-swift")]
+    ),
+    .executableTarget(
+      name: "IshizukiDecodeProbe",
+      dependencies: ["IshizukiKit", .product(name: "MLX", package: "mlx-swift")]
     ),
     .testTarget(
       name: "IshizukiLinkTests",
