@@ -9,6 +9,9 @@ public struct GenerationStats: Sendable {
   public var generatedTokens: Int
   public var promptSeconds: Double
   public var generationSeconds: Double
+  /// Drafted tokens proposed and accepted, for llama-server's `draft_n` / `draft_n_accepted`.
+  public var draftProposed = 0
+  public var draftAccepted = 0
 
   public var promptTokensPerSecond: Double {
     promptSeconds > 0 ? Double(promptTokens) / promptSeconds : 0

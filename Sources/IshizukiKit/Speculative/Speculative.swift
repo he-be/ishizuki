@@ -65,6 +65,10 @@ public final class MTPDrafter: HiddenStateDrafter {
   private let head: MTPHead
   private let cache: ModelCache
   private var pending: [Int] = []
+  private var pendingLogits: MLXArray?
+  /// Applied to the head's logits before the argmax, with the tokens so far (the one the draft
+  /// follows last). The drafted loop sets the target's penalties here (16 §15).
+  public var scoring: ((MLXArray, [Int]) -> MLXArray)?
 
   public var depth: Int { 1 }
 
@@ -82,17 +86,28 @@ public final class MTPDrafter: HiddenStateDrafter {
   public func observe(hidden: MLXArray, nextTokens: [Int]) {
     guard hidden.dim(1) == nextTokens.count, !nextTokens.isEmpty else {
       pending = []
+      pendingLogits = nil
       return
     }
     let ids = MLXArray(nextTokens.map { Int32($0) }).reshaped([1, nextTokens.count])
     let drafted = head(
       hidden: hidden, embeddings: model.backbone.embed(ids), cache: cache)
     let logits = model.backbone.lastLogits(drafted)
-    pending = [logits[0, -1].argMax().item(Int.self)]
+    if scoring != nil {
+      pending = []
+      pendingLogits = logits[0..., -1, 0...]
+    } else {
+      pending = [logits[0, -1].argMax().item(Int.self)]
+      pendingLogits = nil
+    }
   }
 
   public func propose(context: [Int], count: Int) -> [Int] {
     guard count > 0 else { return [] }
+    if let logits = pendingLogits, let scoring {
+      pendingLogits = nil
+      pending = [scoring(logits, context).argMax(axis: -1).item(Int.self)]
+    }
     return Array(pending.prefix(count))
   }
 
@@ -101,6 +116,7 @@ public final class MTPDrafter: HiddenStateDrafter {
   public func reset() {
     cache.reset()
     pending = []
+    pendingLogits = nil
   }
 }
 

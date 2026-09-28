@@ -314,6 +314,8 @@ public final class APIServer: @unchecked Sendable {
     var minP: Float? = nil
     var presencePenalty: Float? = nil
     var seed: UInt64? = nil
+    /// llama-server's per-request `speculative.n_max`: 0 turns drafting off for this request.
+    var draft: Bool? = nil
     /// Token ids never drawn (`logit_bias` of -100 or `false`).
     var bannedTokens: [Int] = []
     /// An already rendered prompt, continued as it is (`/v1/completions`): no template, no
@@ -432,6 +434,7 @@ public final class APIServer: @unchecked Sendable {
 
     let generator = Generator(
       model: model, kvConfig: kvConfig, politeness: politeness)
+    generator.speculativeDecode = request.draft
 
     let opened =
       !raw && request.thinking
@@ -535,9 +538,17 @@ public final class APIServer: @unchecked Sendable {
       : ToolCallParser.parse(
         opened ? "<think>" + result.text : result.text,
         types: ToolCallParser.parameterTypes(request.tools))
+    var generation = result.stats
+    if let drafted = result.speculative {
+      generation.draftProposed = drafted.proposed
+      generation.draftAccepted = drafted.accepted
+      log?(
+        "drafts: \(drafted.accepted)/\(drafted.proposed) accepted over \(drafted.rounds) rounds, "
+          + String(format: "%.1f tok/s", result.stats.generationTokensPerSecond))
+    }
     return (
       parsed, promptTokens.count, result.tokens.count, result.cancelled, promptTokens, reused,
-      finish, result.stats, options
+      finish, generation, options
     )
   }
 
@@ -641,6 +652,8 @@ public final class APIServer: @unchecked Sendable {
       "predicted_n": stats.generatedTokens,
       "predicted_ms": stats.generationSeconds * 1000,
       "predicted_per_second": stats.generationTokensPerSecond,
+      "draft_n": stats.draftProposed,
+      "draft_n_accepted": stats.draftAccepted,
     ]
   }
 
@@ -907,6 +920,7 @@ public final class APIServer: @unchecked Sendable {
     request.topP = (body["top_p"] as? NSNumber)?.floatValue
     request.minP = (body["min_p"] as? NSNumber)?.floatValue
     request.presencePenalty = (body["presence_penalty"] as? NSNumber)?.floatValue
+    if let n = (body["speculative.n_max"] as? NSNumber)?.intValue { request.draft = n > 0 }
     if let seed = (body["seed"] as? NSNumber)?.int64Value, seed >= 0 {
       request.seed = UInt64(seed)
     }

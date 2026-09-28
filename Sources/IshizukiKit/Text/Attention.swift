@@ -64,6 +64,10 @@ public final class Attention: @unchecked Sendable {
     }
   }
 
+  /// Off with `ISHIZUKI_ATTN_FOLD=0`: a 2- to 8-query block takes the broadcast form too.
+  nonisolated(unsafe) public static var foldsVerify =
+    ProcessInfo.processInfo.environment["ISHIZUKI_ATTN_FOLD"] != "0"
+
   public func callAsFunction(
     _ x: MLXArray, mask: MLXArray?, cache: AttentionKVCache?, positions: MLXArray? = nil
   ) -> MLXArray {
@@ -148,6 +152,37 @@ public final class Attention: @unchecked Sendable {
     let d = queries.dim(3)
     let kvHeads = keys.0.dim(1)
     let repeats = numHeads / kvHeads
+
+    // A verify block of a few queries: each KV head's query heads and queries are the rows of
+    // one product. The broadcast form below gives a wrong second row in the weights × values
+    // product (MLX's qvm at two rows over a broadcast batch: max error 0.13 against float32 on an
+    // M6, the first row and the scores exact; 16 §16), and is 2.5 times slower.
+    if repeats > 1, (2...8).contains(l), Attention.foldsVerify,
+      mask == nil || mask!.ndim == 2
+    {
+      let q = (queries * scale).reshaped([b, kvHeads, repeats * l, d])
+      let rowMask = mask.map { MLX.tiled($0, repetitions: [repeats, 1]) }
+      var scores = quantizedMM(
+        q, keys.0, scales: keys.1, biases: keys.2,
+        transpose: true, groupSize: groupSize, bits: keyBits, mode: .affine)
+      var windowScores = window.map { matmul(q, $0.keys.swappedAxes(-1, -2)) }
+      if let rowMask {
+        let quantizedLength = scores.dim(-1)
+        scores = scores + rowMask[.ellipsis, 0..<quantizedLength]
+        windowScores = windowScores.map { $0 + rowMask[.ellipsis, quantizedLength...] }
+      }
+      let combined = windowScores.map { concatenated([scores, $0], axis: -1) } ?? scores
+      let weights = softmax(combined, axis: -1, precise: true)
+      let quantizedLength = scores.dim(-1)
+      var output = quantizedMM(
+        weights[.ellipsis, 0..<quantizedLength], values.0,
+        scales: values.1, biases: values.2,
+        transpose: false, groupSize: groupSize, bits: valueBits, mode: .affine)
+      if let window {
+        output = output + matmul(weights[.ellipsis, quantizedLength...], window.values)
+      }
+      return output.reshaped([b, numHeads, l, d])
+    }
 
     var q = queries * scale
     var qKeys = keys

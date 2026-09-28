@@ -17,13 +17,19 @@ public enum VerifyMatmul {
   /// MLP and projections of 10 MB or more from 3, the 6144-wide ones from 4, attention k and v
   /// from 6.
   static func minimumRows(bytes: Int) -> Int {
-    switch bytes {
+    if let floor = rowFloor { return floor }
+    return switch bytes {
     case 100_000_000...: 2
     case 10_000_000...: 3
     case 5_000_000...: 4
     default: 6
     }
   }
+
+  /// Replaces the table above with one row count for every weight: the table was measured on
+  /// an M1 Max, and another GPU can cross over elsewhere. `ISHIZUKI_VERIFY_MIN_ROWS` sets it.
+  nonisolated(unsafe) public static var rowFloor: Int? =
+    ProcessInfo.processInfo.environment["ISHIZUKI_VERIFY_MIN_ROWS"].flatMap { Int($0) }
 
   nonisolated(unsafe) static var rowBlocks = 4
   nonisolated(unsafe) static var simdgroups = 2

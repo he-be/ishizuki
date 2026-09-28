@@ -113,6 +113,44 @@ public struct Sampler {
     return scores
   }
 
+  /// The bans and the repetition and presence penalties over `recentTokens`, without the
+  /// temperature's truncation: what a draft head's argmax is taken over, so that it proposes the
+  /// token the penalized target is most likely to keep.
+  public func penalizedScores(_ logits: MLXArray, recentTokens: [Int]) -> MLXArray {
+    var scores = logits.asType(.float32)
+    if !bannedTokens.isEmpty {
+      let mask = MLXArray.zeros([scores.dim(-1)], dtype: scores.dtype)
+      mask[MLXArray(bannedTokens.map { Int32($0) })] = MLXArray(-Float.infinity)
+      scores = scores + mask
+    }
+    if let window = window(recentTokens, pending: nil) {
+      if options.repetitionPenalty != 1.0 { scores = applyRepetitionPenalty(scores, window: window) }
+      if options.presencePenalty != 0 { scores = applyPresencePenalty(scores, window: window) }
+    }
+    return scores
+  }
+
+  /// `truncatedScores` for a block of rows checked together, each with its own window: row `i`
+  /// follows `windows[i]`, so a drafted token already counts as seen for the rows after it.
+  /// This is what lets a drafted turn run with a repetition or presence penalty and still draw
+  /// exactly what the plain loop would.
+  public func truncatedScores(rows: MLXArray, windows: [[Int]]) -> MLXArray {
+    precondition(rows.dim(0) == windows.count, "one window per row")
+    guard options.repetitionPenalty != 1.0 || options.presencePenalty != 0 else {
+      return truncatedScores(rows)
+    }
+    var penalized: [MLXArray] = []
+    for (index, tokens) in windows.enumerated() {
+      var row = rows[index ..< (index + 1)].asType(.float32)
+      if let window = window(tokens, pending: nil) {
+        if options.repetitionPenalty != 1.0 { row = applyRepetitionPenalty(row, window: window) }
+        if options.presencePenalty != 0 { row = applyPresencePenalty(row, window: window) }
+      }
+      penalized.append(row)
+    }
+    return truncatedScores(concatenated(penalized, axis: 0))
+  }
+
   private func window(_ tokens: [Int], pending: MLXArray?) -> MLXArray? {
     let context = options.repetitionContext
     guard context > 0 else { return nil }

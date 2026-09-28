@@ -208,6 +208,20 @@ public final class PackedLinear: @unchecked Sendable {
       let shape = h.shape
       let width = shape[shape.count - 1]
       let rows = h.size / width
+      if rows == 2 || (rows == 1 && FewRowQMV.magicSingleRow),
+        let y = FewRowQMV.applyMagic(
+          h.reshaped([rows, width]), weight, scales: scales, biases: biases,
+          groupSize: groupSize, bits: bits)
+      {
+        return y.reshaped(Array(shape.dropLast()) + [outputDim])
+      }
+      if FewRowQMV.supportedRows.contains(rows),
+        let y = FewRowQMV.apply(
+          h.reshaped([rows, width]), weight, scales: scales, biases: biases,
+          groupSize: groupSize, bits: bits)
+      {
+        return y.reshaped(Array(shape.dropLast()) + [outputDim])
+      }
       if VerifyMatmul.supportedRows.contains(rows),
         let y = VerifyMatmul.apply(
           h.reshaped([rows, width]), weight, scales: scales, biases: biases,
